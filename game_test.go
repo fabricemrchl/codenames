@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/fabricemrchl/dictionary"
+	"github.com/jbowens/dictionary"
 )
 
 var testWords []string
