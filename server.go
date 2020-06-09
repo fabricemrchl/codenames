@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jbowens/dictionary"
+	"github.com/fabricemrchl/dictionary"
 )
 
 var closed chan struct{}

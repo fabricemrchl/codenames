@@ -1,6 +1,6 @@
 # codenames
 
-[![GoDoc](https://godoc.org/github.com/jbowens/codenames?status.svg)](https://godoc.org/github.com/jbowens/codenames)
+[![GoDoc](https://godoc.org/github.com/fabricemrchl/codenames?status.svg)](https://godoc.org/github.com/fabricemrchl/codenames)
 
 Codenames implements a web app for generating and displaying boards for the <a href="https://en.wikipedia.org/wiki/Codenames_(board_game)">Codenames</a> board game. Generated boards are shareable and will update as words are revealed. The board can be viewed either as a spymaster or an ordinary player.
 
@@ -13,7 +13,7 @@ A hosted version of the app is available at [www.horsepaste.com](https://www.hor
 The app requires a [Go](https://golang.org/) toolchain, node.js and [parcel](https://parceljs.org/) to build. Once you have those setup, build the application Go binary with:
 
 ```
-go install github.com/jbowens/codenames/cmd/codenames
+go install github.com/fabricemrchl/codenames/cmd/codenames
 ```
 
 Then from the frontend directory, install the node modules:

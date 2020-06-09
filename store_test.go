@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/pebble"
-	"github.com/jbowens/dictionary"
+	"github.com/fabricemrchl/dictionary"
 	"github.com/kr/pretty"
 )
 
