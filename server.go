@@ -13,7 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
+    "crypto/subtle"
 	"github.com/jbowens/dictionary"
 )
 
