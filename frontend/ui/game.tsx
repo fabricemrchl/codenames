@@ -1,11 +1,15 @@
 import * as React from 'react';
 import { Settings, SettingsButton, SettingsPanel } from '~/ui/settings';
+import Timer from '~/ui/timer';
 
 // TODO: remove jquery dependency
 // https://stackoverflow.com/questions/47968529/how-do-i-use-jquery-and-jquery-ui-with-parcel-bundler
 let jquery = require('jquery');
 window.$ = window.jQuery = jquery;
 
+const defaultFavicon = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAA8SURBVHgB7dHBDQAgCAPA1oVkBWdzPR84kW4AD0LCg36bXJqUcLL2eVY/EEwDFQBeEfPnqUpkLmigAvABK38Grs5TfaMAAAAASUVORK5CYII=';
+const blueTurnFavicon = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAmSURBVHgB7cxBAQAABATBo5ls6ulEiPt47ASYqJ6VIWUiICD4Ehyi7wKv/xtOewAAAABJRU5ErkJggg==';
+const redTurnFavicon = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAmSURBVHgB7cwxAQAACMOwgaL5d4EiELGHoxGQGnsVaIUICAi+BAci2gJQFUhklQAAAABJRU5ErkJggg==';
 export class Game extends React.Component {
   constructor(props) {
     super(props);
@@ -38,14 +42,45 @@ export class Game extends React.Component {
     }
   }
 
-  public componentWillMount() {
+  public componentDidMount(prevProps, prevState) {
     window.addEventListener('keydown', this.handleKeyDown.bind(this));
+    this.setDarkMode(prevProps, prevState);
+    this.setTurnIndicatorFavicon(prevProps, prevState);
     this.refresh();
   }
 
   public componentWillUnmount() {
     window.removeEventListener('keydown', this.handleKeyDown.bind(this));
+    document.getElementById("favicon").setAttribute("href", defaultFavicon);
     this.setState({ mounted: false });
+  }
+
+  public componentDidUpdate(prevProps, prevState) {
+    this.setDarkMode(prevProps, prevState);
+    this.setTurnIndicatorFavicon(prevProps, prevState);
+  }
+
+  private setDarkMode(prevProps, prevState) {
+    if (!prevState?.settings.darkMode && this.state.settings.darkMode) {
+      document.body.classList.add('dark-mode');
+    }
+    if (prevState?.settings.darkMode && !this.state.settings.darkMode) {
+      document.body.classList.remove('dark-mode');
+    }
+  }
+
+  private setTurnIndicatorFavicon(prevProps, prevState) {
+    if (
+      prevState?.game?.winning_team !== this.state.game?.winning_team ||
+      prevState?.game?.round !== this.state.game?.round ||
+      prevState?.game?.state_id !== this.state.game?.state_id
+    ) {
+      if (this.state.game?.winning_team) {
+        document.getElementById("favicon").setAttribute("href", defaultFavicon);
+      } else {
+        document.getElementById("favicon").setAttribute("href", this.currentTeam() === 'blue' ? blueTurnFavicon : redTurnFavicon);
+      }
+    }
   }
 
   public refresh() {
@@ -53,20 +88,30 @@ export class Game extends React.Component {
       return;
     }
 
-    const body = { game_id: this.props.gameID };
+    let state_id = '';
     if (this.state.game && this.state.game.state_id) {
-      body.state_id = this.state.game.state_id;
+      state_id = this.state.game.state_id;
     }
-    $.post('/game-state', JSON.stringify(body), data => {
-      if (this.state.game && data.created_at != this.state.game.created_at) {
-        this.setState({ codemaster: false });
-      }
-      this.setState({ game: data });
-    });
 
-    setTimeout(() => {
-      this.refresh();
-    }, 2000);
+    const body = { game_id: this.props.gameID, state_id: state_id };
+    $.ajax({
+      url: '/game-state',
+      type: 'POST',
+      data: JSON.stringify(body),
+      contentType: 'application/json; charset=utf-8',
+      dataType: 'json',
+      success: data => {
+        if (this.state.game && data.created_at != this.state.game.created_at) {
+          this.setState({ codemaster: false });
+        }
+        this.setState({ game: data });
+      },
+      complete: () => {
+        setTimeout(() => {
+          this.refresh();
+        }, 2000);
+      },
+    });
   }
 
   public toggleRole(e, role) {
@@ -74,8 +119,11 @@ export class Game extends React.Component {
     this.setState({ codemaster: role == 'codemaster' });
   }
 
-  public guess(e, idx, word) {
+  public guess(e, idx) {
     e.preventDefault();
+    if (this.state.codemaster && !this.state.settings.spymasterMayGuess) {
+      return; // ignore if player is the codemaster
+    }
     if (this.state.game.revealed[idx]) {
       return; // ignore if already revealed
     }
@@ -86,7 +134,6 @@ export class Game extends React.Component {
       '/guess',
       JSON.stringify({
         game_id: this.state.game.id,
-        state_id: this.state.game.state_id,
         index: idx,
       }),
       g => {
@@ -120,9 +167,9 @@ export class Game extends React.Component {
       '/end-turn',
       JSON.stringify({
         game_id: this.state.game.id,
-        state_id: this.state.game.state_id,
+        current_round: this.state.game.round,
       }),
-      g => {
+      (g) => {
         this.setState({ game: g });
       }
     );
@@ -131,10 +178,9 @@ export class Game extends React.Component {
   public nextGame(e) {
     e.preventDefault();
     // Ask for confirmation when current game hasn't finished
-    let allowNextGame = (
+    let allowNextGame =
       this.state.game.winning_team ||
-      confirm("Do you really want to start a new game?")
-    );
+      confirm('Do you really want to start a new game?');
     if (!allowNextGame) {
       return;
     }
@@ -143,6 +189,8 @@ export class Game extends React.Component {
       JSON.stringify({
         game_id: this.state.game.id,
         word_set: this.state.game.word_set,
+        create_new: true,
+        timer_duration_ms: this.state.game.timer_duration_ms,
       }),
       g => {
         this.setState({ game: g, codemaster: false });
@@ -185,19 +233,12 @@ export class Game extends React.Component {
       );
     }
 
-    // TODO: This is hacky as hell.
-    if (this.state.settings.darkMode) {
-      document.body.classList.add('dark-mode');
-    } else {
-      document.body.classList.remove('dark-mode');
-    }
-
     let status, statusClass;
     if (this.state.game.winning_team) {
       statusClass = this.state.game.winning_team + ' win';
       status = this.state.game.winning_team + ' wins!';
     } else {
-      statusClass = this.currentTeam();
+      statusClass = this.currentTeam()+'-turn';
       status = this.currentTeam() + "'s turn";
     }
 
@@ -221,13 +262,26 @@ export class Game extends React.Component {
     if (!this.state.settings.fullscreen) {
       shareLink = (
         <div id="share">
-          Send this link to friends:
+          Send this link to friends:&nbsp;
           <a className="url" href={window.location.href}>
             {window.location.href}
           </a>
         </div>
       );
     }
+
+    const timer = !!this.state.game.timer_duration_ms && (
+      <div id="timer">
+        <Timer
+          roundStartedAt={this.state.game.round_started_at}
+          timerDurationMs={this.state.game.timer_duration_ms}
+          handleExpiration={() => {
+              this.state.game.enforce_timer && this.endTurn();
+          }}
+          freezeTimer={!!this.state.game.winning_team}
+        />
+      </div>
+    );
 
     return (
       <div
@@ -237,7 +291,10 @@ export class Game extends React.Component {
           this.extraClasses()
         }
       >
-        {shareLink}
+        <div id="infoContent">
+          {shareLink}
+          {timer}
+        </div>
         <div id="status-line" className={statusClass}>
           <div id="remaining">
             <span className={this.state.game.starting_team + '-remaining'}>
@@ -253,7 +310,7 @@ export class Game extends React.Component {
           </div>
           {endTurnButton}
         </div>
-        <div className="board">
+        <div className={"board " + statusClass}>
           {this.state.game.words.map((w, idx) => (
             <div
               key={idx}
@@ -261,6 +318,7 @@ export class Game extends React.Component {
                 'cell ' +
                 this.state.game.layout[idx] +
                 ' ' +
+                (this.state.codemaster && !this.state.settings.spymasterMayGuess ? 'disabled ' : '') +
                 (this.state.game.revealed[idx] ? 'revealed' : 'hidden-word')
               }
               onClick={e => this.guess(e, idx, w)}

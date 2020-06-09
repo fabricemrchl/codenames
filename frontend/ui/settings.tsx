@@ -1,17 +1,26 @@
 import * as React from 'react';
+import ToggleSet from '~/ui/toggle-set';
 
 const settingToggles = [
   {
     name: 'Full-screen',
     setting: 'fullscreen',
+    desc: 'Enlarge the board to take up the whole page.',
   },
   {
     name: 'Color-blind',
     setting: 'colorBlind',
+    desc: 'Add patterned borders to help color-blind players distinguish teams.',
   },
   {
     name: 'Dark',
     setting: 'darkMode',
+    desc: 'Darken the mood.',
+  },
+  {
+    name: 'Spymaster may guess',
+    setting: 'spymasterMayGuess',
+    desc: 'When enabled, clicking a word from spymaster view reveals the word.',
   },
 ];
 
@@ -88,24 +97,12 @@ export class SettingsPanel extends React.Component {
           <h2>SETTINGS</h2>
           <div className="toggles">
             {settingToggles.map(toggle => (
-              <div className="toggle-set" key={toggle.setting}>
-                <div className="settings-label">
-                  {toggle.name}{' '}
-                  <span className={'toggle-state'}>
-                    {this.props.values[toggle.setting] ? 'ON' : 'OFF'}
-                  </span>
-                </div>
-                <div
-                  onClick={e => this.props.toggle(e, toggle.setting)}
-                  className={
-                    this.props.values[toggle.setting]
-                      ? 'toggle active'
-                      : 'toggle inactive'
-                  }
-                >
-                  <div className="switch"></div>
-                </div>
-              </div>
+              <ToggleSet
+                key={toggle.name}
+                values={this.props.values}
+                toggle={toggle}
+                handleToggle={this.props.toggle}
+              />
             ))}
           </div>
         </div>

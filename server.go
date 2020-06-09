@@ -2,73 +2,144 @@ package codenames
 
 import (
 	"encoding/json"
-	"fmt"
 	"html/template"
+	"io"
+	"log"
 	"net/http"
-	"path"
+	"net/http/pprof"
+	"os"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jbowens/dictionary"
 )
 
+var closed chan struct{}
+
+func init() {
+	closed = make(chan struct{})
+	close(closed)
+}
+
 type Server struct {
 	Server http.Server
-	tpl    *template.Template
+	Store  Store
 
+	tpl         *template.Template
 	gameIDWords []string
 
 	mu           sync.Mutex
-	games        map[string]*Game
+	games        map[string]*GameHandle
 	defaultWords []string
 	mux          *http.ServeMux
+
+	statOpenRequests  int64 // atomic access
+	statTotalRequests int64 //atomic access
 }
 
-func (s *Server) getGame(gameID, stateID string) (*Game, bool) {
-	g, ok := s.games[gameID]
-	if ok {
-		return g, ok
+type Store interface {
+	Save(*Game) error
+}
+
+type GameHandle struct {
+	store Store
+
+	mu        sync.Mutex
+	updated   chan struct{} // closed when the game is updated
+	replaced  chan struct{} // closed when the game has been replaced
+	marshaled []byte
+	g         *Game
+}
+
+func newHandle(g *Game, s Store) *GameHandle {
+	gh := &GameHandle{
+		store:    s,
+		g:        g,
+		updated:  make(chan struct{}),
+		replaced: make(chan struct{}),
 	}
-	state, ok := decodeGameState(stateID, s.defaultWords)
+	err := s.Save(g)
+	if err != nil {
+		log.Printf("Unable to write updated game %q to disk: %s\n", gh.g.ID, err)
+	}
+	return gh
+}
+
+func (gh *GameHandle) update(fn func(*Game) bool) {
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+	ok := fn(gh.g)
 	if !ok {
-		return nil, false
+		// game wasn't updated
+		return
 	}
-	g = newGame(gameID, state)
-	s.games[gameID] = g
-	return g, true
+
+	gh.marshaled = nil
+	ch := gh.updated
+	gh.updated = make(chan struct{})
+
+	// write the updated game to disk
+	err := gh.store.Save(gh.g)
+	if err != nil {
+		log.Printf("Unable to write updated game %q to disk: %s\n", gh.g.ID, err)
+	}
+
+	close(ch)
 }
 
-// GET /game/<id>
-// (deprecated: use POST /game-state instead)
-func (s *Server) handleRetrieveGame(rw http.ResponseWriter, req *http.Request) {
+func (gh *GameHandle) gameStateChanged(stateID *string) (updated <-chan struct{}, replaced <-chan struct{}) {
+	if stateID == nil {
+		return closed, nil
+	}
+
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+	if gh.g.StateID() != *stateID {
+		return closed, nil
+	}
+	return gh.updated, gh.replaced
+}
+
+// MarshalJSON implements the encoding/json.Marshaler interface.
+// It caches a marshalled value of the game object.
+func (gh *GameHandle) MarshalJSON() ([]byte, error) {
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+
+	var err error
+	if gh.marshaled == nil {
+		gh.marshaled, err = json.Marshal(struct {
+			*Game
+			StateID string `json:"state_id"`
+		}{gh.g, gh.g.StateID()})
+	}
+	return gh.marshaled, err
+}
+
+func (s *Server) getGame(gameID string) (*GameHandle, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.getGameLocked(gameID)
+}
 
-	err := req.ParseForm()
-	if err != nil {
-		http.Error(rw, "Error decoding query string", 400)
-		return
-	}
-
-	gameID := path.Base(req.URL.Path)
-	g, ok := s.getGame(gameID, req.Form.Get("state_id"))
+func (s *Server) getGameLocked(gameID string) (*GameHandle, bool) {
+	gh, ok := s.games[gameID]
 	if ok {
-		writeGame(rw, g)
-		return
+		return gh, ok
 	}
-
-	g = newGame(gameID, randomState(s.defaultWords))
-	s.games[gameID] = g
-	writeGame(rw, g)
+	gh = newHandle(newGame(gameID, randomState(s.defaultWords), GameOptions{}), s.Store)
+	s.games[gameID] = gh
+	return gh, true
 }
 
 // POST /game-state
 func (s *Server) handleGameState(rw http.ResponseWriter, req *http.Request) {
 	var body struct {
-		GameID  string `json:"game_id"`
-		StateID string `json:"state_id"`
+		GameID  string  `json:"game_id"`
+		StateID *string `json:"state_id"`
 	}
 	err := json.NewDecoder(req.Body).Decode(&body)
 	if err != nil {
@@ -77,23 +148,40 @@ func (s *Server) handleGameState(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	g, ok := s.getGame(body.GameID, body.StateID)
-	if ok {
-		writeGame(rw, g)
+	gh, ok := s.getGameLocked(body.GameID)
+	if !ok {
+		gh = newHandle(newGame(body.GameID, randomState(s.defaultWords), GameOptions{}), s.Store)
+		s.games[body.GameID] = gh
+		s.mu.Unlock()
+		writeGame(rw, gh)
 		return
 	}
-	g = newGame(body.GameID, randomState(s.defaultWords))
-	s.games[body.GameID] = g
-	writeGame(rw, g)
+	s.mu.Unlock()
+
+	updated, replaced := gh.gameStateChanged(body.StateID)
+
+	select {
+	case <-req.Context().Done():
+		return
+	case <-time.After(15 * time.Second):
+		writeGame(rw, gh)
+	case <-updated:
+		writeGame(rw, gh)
+	case <-replaced:
+		gh, ok = s.getGame(body.GameID)
+		if !ok {
+			http.Error(rw, "Game removed", 400)
+			return
+		}
+		writeGame(rw, gh)
+	}
 }
 
 // POST /guess
 func (s *Server) handleGuess(rw http.ResponseWriter, req *http.Request) {
 	var request struct {
-		GameID  string `json:"game_id"`
-		StateID string `json:"state_id"`
-		Index   int    `json:"index"`
+		GameID string `json:"game_id"`
+		Index  int    `json:"index"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -102,27 +190,29 @@ func (s *Server) handleGuess(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	g, ok := s.getGame(request.GameID, request.StateID)
+	gh, ok := s.getGame(request.GameID)
 	if !ok {
 		http.Error(rw, "No such game", 404)
 		return
 	}
 
-	if err := g.Guess(request.Index); err != nil {
+	var err error
+	gh.update(func(g *Game) bool {
+		err = g.Guess(request.Index)
+		return err == nil
+	})
+	if err != nil {
 		http.Error(rw, err.Error(), 400)
 		return
 	}
-	writeGame(rw, g)
+	writeGame(rw, gh)
 }
 
 // POST /end-turn
 func (s *Server) handleEndTurn(rw http.ResponseWriter, req *http.Request) {
 	var request struct {
-		GameID  string `json:"game_id"`
-		StateID string `json:"state_id"`
+		GameID       string `json:"game_id"`
+		CurrentRound int    `json:"current_round"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -131,26 +221,25 @@ func (s *Server) handleEndTurn(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	g, ok := s.getGame(request.GameID, request.StateID)
+	gh, ok := s.getGame(request.GameID)
 	if !ok {
 		http.Error(rw, "No such game", 404)
 		return
 	}
 
-	if err := g.NextTurn(); err != nil {
-		http.Error(rw, err.Error(), 400)
-		return
-	}
-	writeGame(rw, g)
+	gh.update(func(g *Game) bool {
+		return g.NextTurn(request.CurrentRound)
+	})
+	writeGame(rw, gh)
 }
 
 func (s *Server) handleNextGame(rw http.ResponseWriter, req *http.Request) {
 	var request struct {
-		GameID  string   `json:"game_id"`
-		WordSet []string `json:"word_set"`
+		GameID          string   `json:"game_id"`
+		WordSet         []string `json:"word_set"`
+		CreateNew       bool     `json:"create_new"`
+		TimerDurationMS int64    `json:"timer_duration_ms"`
+		EnforceTimer    bool     `json:"enforce_timer"`
 	}
 
 	if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
@@ -166,59 +255,97 @@ func (s *Server) handleNextGame(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	var gh *GameHandle
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-	words := s.defaultWords
-	if len(wordSet) > 0 {
-		words = nil
-		for w := range wordSet {
-			words = append(words, w)
+		words := s.defaultWords
+		if len(wordSet) > 0 {
+			words = nil
+			for w := range wordSet {
+				words = append(words, w)
+			}
+			sort.Strings(words)
 		}
-		sort.Strings(words)
-	}
 
-	g := newGame(request.GameID, randomState(words))
-	s.games[request.GameID] = g
-	writeGame(rw, g)
+		opts := GameOptions{
+			TimerDurationMS: request.TimerDurationMS,
+			EnforceTimer:    request.EnforceTimer,
+		}
+
+		var ok bool
+		gh, ok = s.games[request.GameID]
+		if !ok {
+			// no game exists, create for the first time
+			gh = newHandle(newGame(request.GameID, randomState(words), opts), s.Store)
+			s.games[request.GameID] = gh
+		} else if request.CreateNew {
+			replacedCh := gh.replaced
+
+			nextState := nextGameState(gh.g.GameState)
+			gh = newHandle(newGame(request.GameID, nextState, opts), s.Store)
+			s.games[request.GameID] = gh
+
+			// signal to waiting /game-state goroutines that the
+			// old game was swapped out for a new game.
+			close(replacedCh)
+		}
+	}()
+	writeGame(rw, gh)
 }
 
 type statsResponse struct {
-	InProgress int `json:"games_in_progress"`
+	GamesTotal          int   `json:"games_total"`
+	GamesInProgress     int   `json:"games_in_progress"`
+	GamesCreatedOneHour int   `json:"games_created_1h"`
+	RequestsTotal       int64 `json:"requests_total_process_lifetime"`
+	RequestsInFlight    int64 `json:"requests_in_flight"`
 }
 
 func (s *Server) handleStats(rw http.ResponseWriter, req *http.Request) {
-	var inProgress int
+	hourAgo := time.Now().Add(-time.Hour)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, g := range s.games {
-		if g.WinningTeam == nil {
+	var inProgress, createdWithinAnHour int
+	for _, gh := range s.games {
+		gh.mu.Lock()
+		if gh.g.WinningTeam == nil && gh.g.anyRevealed() {
 			inProgress++
 		}
+		if hourAgo.Before(gh.g.CreatedAt) {
+			createdWithinAnHour++
+		}
+		gh.mu.Unlock()
 	}
-	writeJSON(rw, statsResponse{inProgress})
+	writeJSON(rw, statsResponse{
+		GamesTotal:          len(s.games),
+		GamesInProgress:     inProgress,
+		GamesCreatedOneHour: createdWithinAnHour,
+		RequestsTotal:       atomic.LoadInt64(&s.statTotalRequests),
+		RequestsInFlight:    atomic.LoadInt64(&s.statOpenRequests),
+	})
 }
 
 func (s *Server) cleanupOldGames() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for id, g := range s.games {
-		if g.WinningTeam != nil && g.CreatedAt.Add(12*time.Hour).Before(time.Now()) {
+	for id, gh := range s.games {
+		gh.mu.Lock()
+		if gh.g.WinningTeam != nil && gh.g.CreatedAt.Add(3*time.Hour).Before(time.Now()) {
 			delete(s.games, id)
-			fmt.Printf("Removed completed game %s\n", id)
-			continue
-		}
-		if g.CreatedAt.Add(24 * time.Hour).Before(time.Now()) {
+			log.Printf("Removed completed game %s\n", id)
+		} else if gh.g.CreatedAt.Add(72 * time.Hour).Before(time.Now()) {
 			delete(s.games, id)
-			fmt.Printf("Removed expired game %s\n", id)
-			continue
+			log.Printf("Removed expired game %s\n", id)
 		}
+		gh.mu.Unlock()
 	}
 }
 
-func (s *Server) Start() error {
+func (s *Server) Start(games map[string]*Game) error {
 	gameIDs, err := dictionary.Load("assets/game-id-words.txt")
 	if err != nil {
 		return err
@@ -237,18 +364,30 @@ func (s *Server) Start() error {
 	s.mux.HandleFunc("/next-game", s.handleNextGame)
 	s.mux.HandleFunc("/end-turn", s.handleEndTurn)
 	s.mux.HandleFunc("/guess", s.handleGuess)
-	s.mux.HandleFunc("/game/", s.handleRetrieveGame)
 	s.mux.HandleFunc("/game-state", s.handleGameState)
 	s.mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("frontend/dist"))))
 	s.mux.HandleFunc("/", s.handleIndex)
 
-	gameIDs = dictionary.Filter(gameIDs, func(s string) bool { return len(s) > 3 })
+	gameIDs = dictionary.Filter(gameIDs, func(s string) bool { return len(s) >= 3 })
 	s.gameIDWords = gameIDs.Words()
+	for i, w := range s.gameIDWords {
+		s.gameIDWords[i] = strings.ToLower(w)
+	}
 
-	s.games = make(map[string]*Game)
+	s.games = make(map[string]*GameHandle)
 	s.defaultWords = d.Words()
 	sort.Strings(s.defaultWords)
-	s.Server.Handler = s.mux
+	s.Server.Handler = withPProfHandler(s)
+
+	if s.Store == nil {
+		s.Store = discardStore{}
+	}
+
+	if games != nil {
+		for _, g := range games {
+			s.games[g.ID] = newHandle(g, s.Store)
+		}
+	}
 
 	go func() {
 		for range time.Tick(10 * time.Minute) {
@@ -256,15 +395,52 @@ func (s *Server) Start() error {
 		}
 	}()
 
-	fmt.Println("Started server. Available on http://localhost:9091")
 	return s.Server.ListenAndServe()
 }
 
-func writeGame(rw http.ResponseWriter, g *Game) {
-	writeJSON(rw, struct {
-		*Game
-		StateID string `json:"state_id"`
-	}{g, g.GameState.ID()})
+func (s *Server) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	atomic.AddInt64(&s.statTotalRequests, 1)
+	atomic.AddInt64(&s.statOpenRequests, 1)
+	defer func() { atomic.AddInt64(&s.statOpenRequests, -1) }()
+
+	s.mux.ServeHTTP(rw, req)
+}
+
+func withPProfHandler(next http.Handler) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	pprofHandler := basicAuth(mux, os.Getenv("PPROFPW"), "admin")
+
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if strings.HasPrefix(req.URL.Path, "/debug/pprof") {
+			pprofHandler.ServeHTTP(rw, req)
+			return
+		}
+		next.ServeHTTP(rw, req)
+	})
+}
+
+func basicAuth(handler http.Handler, password, realm string) http.Handler {
+	p := []byte(password)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, pass, ok := r.BasicAuth()
+		if !ok || subtle.ConstantTimeCompare([]byte(pass), p) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`"`)
+			w.WriteHeader(401)
+			io.WriteString(w, "Unauthorized\n")
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+}
+
+func writeGame(rw http.ResponseWriter, gh *GameHandle) {
+	writeJSON(rw, gh)
 }
 
 func writeJSON(rw http.ResponseWriter, resp interface{}) {
