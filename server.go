@@ -37,11 +37,13 @@ type Server struct {
 	mux          *http.ServeMux
 
 	statOpenRequests  int64 // atomic access
-	statTotalRequests int64 //atomic access
+	statTotalRequests int64 // atomic access
 }
 
 type Store interface {
 	Save(*Game) error
+	Delete(*Game) error
+	Checkpoint(io.Writer) error
 }
 
 type GameHandle struct {
@@ -283,6 +285,8 @@ func (s *Server) handleNextGame(rw http.ResponseWriter, req *http.Request) {
 		} else if request.CreateNew {
 			replacedCh := gh.replaced
 
+			previousGame := gh.g
+
 			nextState := nextGameState(gh.g.GameState)
 			gh = newHandle(newGame(request.GameID, nextState, opts), s.Store)
 			s.games[request.GameID] = gh
@@ -290,6 +294,14 @@ func (s *Server) handleNextGame(rw http.ResponseWriter, req *http.Request) {
 			// signal to waiting /game-state goroutines that the
 			// old game was swapped out for a new game.
 			close(replacedCh)
+
+			// Delete the old game from the store. This isn't strictly
+			// necessary, but it helps us reclaim disk space a little more
+			// quickly.
+			err := s.Store.Delete(previousGame)
+			if err != nil {
+				log.Printf("Unable to delete old game %q from disk: %s\n", previousGame.ID, err)
+			}
 		}
 	}()
 	writeGame(rw, gh)
@@ -327,6 +339,13 @@ func (s *Server) handleStats(rw http.ResponseWriter, req *http.Request) {
 		RequestsTotal:       atomic.LoadInt64(&s.statTotalRequests),
 		RequestsInFlight:    atomic.LoadInt64(&s.statOpenRequests),
 	})
+}
+
+func (s *Server) handleCheckpoint(rw http.ResponseWriter, req *http.Request) {
+	err := s.Store.Checkpoint(rw)
+	if err != nil {
+		log.Printf("[ERROR] Write checkpoint %s\n", err)
+	}
 }
 
 func (s *Server) cleanupOldGames() {
@@ -367,6 +386,17 @@ func (s *Server) Start(games map[string]*Game) error {
 	s.mux.HandleFunc("/game-state", s.handleGameState)
 	s.mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("frontend/dist"))))
 	s.mux.HandleFunc("/", s.handleIndex)
+
+	bootstrapPW := os.Getenv("BOOTSTRAPPW")
+	// If no bootstrap PW is set, don't expose the checkpoint endpoint so we
+	// don't default to open.
+	if bootstrapPW != "" {
+		log.Printf("/checkpoint endpoint enabled\n")
+		s.mux.Handle("/checkpoint", basicAuth(
+			http.HandlerFunc(s.handleCheckpoint),
+			os.Getenv("BOOTSTRAPPW"),
+			"admin"))
+	}
 
 	gameIDs = dictionary.Filter(gameIDs, func(s string) bool { return len(s) >= 3 })
 	s.gameIDWords = gameIDs.Words()

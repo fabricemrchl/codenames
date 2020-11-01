@@ -10,7 +10,8 @@ const settingToggles = [
   {
     name: 'Color-blind',
     setting: 'colorBlind',
-    desc: 'Add patterned borders to help color-blind players distinguish teams.',
+    desc:
+      'Add patterned borders to help color-blind players distinguish teams.',
   },
   {
     name: 'Dark',
@@ -52,7 +53,11 @@ export class SettingsButton extends React.Component {
 
   public render() {
     return (
-      <button onClick={e => this.handleClick(e)} className="gear">
+      <button
+        onClick={(e) => this.handleClick(e)}
+        className="gear"
+        aria-label="settings"
+      >
         <svg
           width="30"
           height="30"
@@ -77,7 +82,10 @@ export class SettingsPanel extends React.Component {
   public render() {
     return (
       <div className="settings">
-        <div onClick={e => this.props.toggleView(e)} className="close-settings">
+        <div
+          onClick={(e) => this.props.toggleView(e)}
+          className="close-settings"
+        >
           <svg
             width="32"
             height="32"
@@ -90,13 +98,15 @@ export class SettingsPanel extends React.Component {
               transform="translate(1 1)"
               stroke="black"
               strokeWidth="2"
+              role="button"
+              aria-label="close settings"
             />
           </svg>
         </div>
         <div className="settings-content">
           <h2>SETTINGS</h2>
           <div className="toggles">
-            {settingToggles.map(toggle => (
+            {settingToggles.map((toggle) => (
               <ToggleSet
                 key={toggle.name}
                 values={this.props.values}
