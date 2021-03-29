@@ -1,5 +1,5 @@
 # Build backend.
-FROM golang:1.14-alpine as backend
+FROM golang:1.16-alpine as backend
 WORKDIR /app
 COPY . .
 RUN apk add gcc musl-dev \
